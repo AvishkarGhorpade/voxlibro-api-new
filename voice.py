@@ -26,9 +26,12 @@ FILE_TTL_SECONDS  = 600    # 10 min — generated files
 CACHE_TTL_SECONDS = 3600   # 1 hour — cached files
 
 # ── Voice table ───────────────────────────────────────────────────────────────
-# key → edge-tts voice name
+# key → edge-tts voice name.
+# The original 12 keys (en-US-female, en-US-male, etc.) are UNCHANGED — any
+# saved selectedVoice value in existing app installs keeps working identically.
+# Everything below that is new, additive English variety.
 VOICE_OPTIONS: dict[str, str] = {
-    # English
+    # ── Original 12 — unchanged ─────────────────────────────────────────────
     "en-US-female": "en-US-JennyNeural",
     "en-US-male":   "en-US-GuyNeural",
     "en-GB-female": "en-GB-SoniaNeural",
@@ -37,12 +40,51 @@ VOICE_OPTIONS: dict[str, str] = {
     "en-IN-male":   "en-IN-PrabhatNeural",
     "en-AU-female": "en-AU-NatashaNeural",
     "en-AU-male":   "en-AU-WilliamNeural",
-    # Hindi
     "hi-female":    "hi-IN-SwaraNeural",
     "hi-male":      "hi-IN-MadhurNeural",
-    # Marathi
     "mr-female":    "mr-IN-AarohiNeural",
     "mr-male":      "mr-IN-ManoharNeural",
+
+    # ── en-US — 14 additional confirmed voices ──────────────────────────────
+    "en-US-aria-female":              "en-US-AriaNeural",
+    "en-US-ana-female":               "en-US-AnaNeural",
+    "en-US-andrew-male":              "en-US-AndrewNeural",
+    "en-US-andrew-multilingual-male": "en-US-AndrewMultilingualNeural",
+    "en-US-ava-female":               "en-US-AvaNeural",
+    "en-US-ava-multilingual-female":  "en-US-AvaMultilingualNeural",
+    "en-US-brian-male":               "en-US-BrianNeural",
+    "en-US-brian-multilingual-male":  "en-US-BrianMultilingualNeural",
+    "en-US-christopher-male":         "en-US-ChristopherNeural",
+    "en-US-emma-multilingual-female": "en-US-EmmaMultilingualNeural",
+    "en-US-eric-male":                "en-US-EricNeural",
+    "en-US-michelle-female":          "en-US-MichelleNeural",
+    "en-US-roger-male":               "en-US-RogerNeural",
+    "en-US-steffan-male":             "en-US-SteffanNeural",
+
+    # ── en-GB — 3 additional confirmed voices ───────────────────────────────
+    "en-GB-libby-female":  "en-GB-LibbyNeural",
+    "en-GB-maisie-female": "en-GB-MaisieNeural",
+    "en-GB-thomas-male":   "en-GB-ThomasNeural",
+
+    # ── Other English accents — one voice family each, all confirmed ───────
+    "en-CA-clara-female":   "en-CA-ClaraNeural",
+    "en-IE-emily-female":   "en-IE-EmilyNeural",
+    "en-KE-asilia-female":  "en-KE-AsiliaNeural",
+    "en-KE-chilemba-male":  "en-KE-ChilembaNeural",
+    "en-NG-abeo-male":      "en-NG-AbeoNeural",
+    "en-NG-ezinne-female":  "en-NG-EzinneNeural",
+    "en-NZ-mitchell-male":  "en-NZ-MitchellNeural",
+    "en-NZ-molly-female":   "en-NZ-MollyNeural",
+    "en-PH-james-male":     "en-PH-JamesNeural",
+    "en-PH-rosa-female":    "en-PH-RosaNeural",
+    "en-SG-luna-female":    "en-SG-LunaNeural",
+    "en-SG-wayne-male":     "en-SG-WayneNeural",
+    "en-TZ-elimu-male":     "en-TZ-ElimuNeural",
+    "en-TZ-imani-female":   "en-TZ-ImaniNeural",
+    "en-ZA-leah-female":    "en-ZA-LeahNeural",
+    "en-ZA-luke-male":      "en-ZA-LukeNeural",
+    "en-HK-sam-male":       "en-HK-SamNeural",
+    "en-HK-yan-female":     "en-HK-YanNeural",
 }
 
 DEFAULT_VOICE = "en-US-female"
