@@ -15,12 +15,15 @@ from voice import (
     text_to_wav,
     text_to_wav_chunked,
     stream_audio_chunks,
+    stream_pdf_audio,
     text_to_wav_with_timings,
     extract_text_from_pdf,
     list_voices,
     run_garbage_collection,
     scheduled_gc,
     detect_language,
+    validate_stream_params,
+    validate_chunked_params,
     PREVIEW_TEXT,
 )
 
@@ -294,6 +297,7 @@ async def tts_stream(
     whole response then play" client gets no benefit over /tts/text/form.
     """
     try:
+        validate_stream_params(text, voice, gender)
         generator = stream_audio_chunks(
             text=text, voice_key=voice, rate=rate, volume=volume, pitch=pitch, gender=gender,
         )
@@ -393,6 +397,59 @@ async def tts_from_pdf(
         raise HTTPException(status_code=500, detail=str(e))
 
     return _wav_response(wav_path, used_voice, background_tasks)
+
+
+@app.post("/tts/pdf/stream", tags=["TTS"], summary="PDF → streaming MP3 audio", dependencies=[Depends(verify_request)])
+async def tts_pdf_stream(
+    file:   UploadFile = File(...),
+    voice:  str = Form("auto"),
+    gender: str = Form("female"),
+    rate:   str = Form("+0%"),
+    volume: str = Form("+0%"),
+    pitch:  str = Form("+0Hz"),
+):
+    """
+    Upload a PDF → audio streams back progressively as it generates,
+    instead of waiting for the whole document to finish before anything is
+    sent. Handles any PDF length (chunked internally, same as /tts/pdf) —
+    by the time later pages are still generating, earlier pages' audio has
+    likely already reached the client.
+
+    The complete result is cached automatically once generation finishes
+    (same cache the non-streaming endpoints use) — a repeat request for
+    the identical PDF+voice+rate+pitch streams back instantly from cache
+    rather than regenerating.
+
+    NOTE: seeing the "starts speaking immediately" benefit requires the
+    client to play the stream progressively (e.g. ExoPlayer/MediaPlayer
+    pointed at this URL) rather than buffering the full response first —
+    this is the API side of that; the Android app doesn't consume it this
+    way yet.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="Only PDF files are supported.")
+
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+
+    try:
+        text = extract_text_from_pdf(pdf_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF parsing error: {e}")
+
+    try:
+        validate_chunked_params(text, voice, gender)
+        generator = stream_pdf_audio(
+            text=text, voice_key=voice, rate=rate, volume=volume, pitch=pitch, gender=gender,
+        )
+        return StreamingResponse(generator, media_type="audio/mpeg")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/tts/preview/{voice_key}", tags=["TTS"], summary="Quick voice preview", dependencies=[Depends(verify_request)])

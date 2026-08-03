@@ -280,6 +280,37 @@ def _resolve_voice_and_pitch(text: str, voice_key: str, pitch: str, gender: str)
     return voice_key, voice_name, _normalize_pitch(pitch)
 
 
+def validate_stream_params(text: str, voice_key: str, gender: str) -> None:
+    """
+    Call this BEFORE creating a StreamingResponse around stream_audio_chunks.
+    That's an async generator — calling it just creates the generator
+    object, it doesn't run any code yet, so a ValueError inside it only
+    fires once Starlette has already started sending a 200 response. That
+    turns a validation error into a corrupted stream instead of a clean
+    HTTP error. Calling this first, synchronously, in the route handler
+    avoids that. Enforces the normal 50,000-char single-request cap.
+    """
+    _resolve_voice_and_pitch(text, voice_key, "+0Hz", gender)
+
+
+def validate_chunked_params(text: str, voice_key: str, gender: str) -> None:
+    """
+    Same purpose as validate_stream_params, but for stream_pdf_audio —
+    which is explicitly meant to handle text OVER 50,000 characters via
+    chunking, so it must NOT apply that single-request cap. Only checks
+    that the voice key is valid and text isn't empty.
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("Text cannot be empty.")
+    resolved_key = auto_select_voice(text, preferred_gender=gender) if voice_key == "auto" else voice_key
+    if resolved_key not in VOICE_OPTIONS:
+        raise ValueError(
+            f"Unknown voice '{resolved_key}'. "
+            f"Available: {list(VOICE_OPTIONS.keys())} or 'auto'"
+        )
+
+
 async def text_to_wav(
     text: str,
     voice_key: str = "auto",
@@ -392,18 +423,31 @@ async def text_to_wav_chunked(
     if len(text) <= max_chars:
         return await text_to_wav(text, voice_key, rate, volume, pitch, gender)
 
+    resolved_voice_key = auto_select_voice(text, preferred_gender=gender) if voice_key == "auto" else voice_key
+    voice_name_check = VOICE_OPTIONS.get(resolved_voice_key)
+    if not voice_name_check:
+        raise ValueError(
+            f"Unknown voice '{resolved_voice_key}'. "
+            f"Available: {list(VOICE_OPTIONS.keys())} or 'auto'"
+        )
+    voice_key = resolved_voice_key
+    pitch_hz = _normalize_pitch(pitch)
+
+    # A repeat request for the exact same long text+voice+rate+pitch (e.g.
+    # someone re-converts the same PDF) skips regeneration entirely.
+    cached_combined = get_cached_file(text, voice_key, rate, pitch_hz)
+    if cached_combined:
+        return cached_combined, voice_key
+
     chunks = _split_text_for_chunking(text, max_chars)
     if not chunks:
         raise ValueError("Text produced no chunks after splitting.")
 
     chunk_paths: list[Path] = []
     used_voice = voice_key
-    try:
-        for chunk in chunks:
-            chunk_path, used_voice = await text_to_wav(chunk, voice_key, rate, volume, pitch, gender)
-            chunk_paths.append(chunk_path)
-    except Exception:
-        raise  # individual chunk errors already carry a clear message
+    for chunk in chunks:
+        chunk_path, used_voice = await text_to_wav(chunk, voice_key, rate, volume, pitch, gender)
+        chunk_paths.append(chunk_path)
 
     combined = OUTPUT_DIR / f"{uuid.uuid4().hex}_combined.wav"
     with open(combined, "wb") as out:
@@ -413,6 +457,11 @@ async def text_to_wav_chunked(
         # NOTE: chunk_paths are cache files (get_cached_file/save_to_cache
         # paths under CACHE_DIR) — do NOT delete them here, they're meant
         # to persist and be reused by future requests.
+
+    # Cache the COMBINED result too (regardless of the 5,000-char cap that
+    # applies to individual chunks — a full PDF's audio is exactly the kind
+    # of expensive-to-regenerate result worth caching even if large).
+    save_to_cache(text, voice_key, rate, pitch_hz, combined)
 
     logger.info(f"Chunked generation: {len(chunks)} chunks | voice={used_voice} | total_chars={len(text)}")
     return combined, used_voice
@@ -481,6 +530,90 @@ async def stream_audio_chunks(
         filename.unlink(missing_ok=True)  # don't leave large uncached files around
 
     logger.info(f"Streamed: voice={voice_key} | pitch={pitch_hz} | bytes={total_bytes} | chars={len(text)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PDF STREAMING — combines chunking (arbitrary-length PDFs, same as
+#  text_to_wav_chunked) with progressive streaming (playback can start on
+#  the first chunk's audio while later chunks are still generating).
+#
+#  On a cache hit for the full text, this just streams the cached file
+#  straight off disk — fast, and behaves like a normal file download from
+#  the client's point of view. On a miss, chunks are generated and streamed
+#  one after another; by the time the LAST chunk starts generating, the
+#  FIRST chunk's audio has likely already finished playing client-side.
+#  The complete result is written to a single file as it goes and cached
+#  at the end — this is the "save it once it's done" behavior requested.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def stream_pdf_audio(
+    text: str,
+    voice_key: str = "auto",
+    rate: str = "+0%",
+    volume: str = "+0%",
+    pitch: str = "+0Hz",
+    gender: str = "female",
+    max_chars: int = 4500,
+) -> AsyncGenerator[bytes, None]:
+    text = text.strip()
+    if not text:
+        raise ValueError("Text cannot be empty.")
+
+    resolved_voice_key = auto_select_voice(text, preferred_gender=gender) if voice_key == "auto" else voice_key
+    voice_name = VOICE_OPTIONS.get(resolved_voice_key)
+    if not voice_name:
+        raise ValueError(
+            f"Unknown voice '{resolved_voice_key}'. "
+            f"Available: {list(VOICE_OPTIONS.keys())} or 'auto'"
+        )
+    voice_key = resolved_voice_key
+    pitch_hz = _normalize_pitch(pitch)
+
+    # Fast path: identical PDF+voice+rate+pitch requested before.
+    cached = get_cached_file(text, voice_key, rate, pitch_hz)
+    if cached:
+        with open(cached, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+        return
+
+    chunks = _split_text_for_chunking(text, max_chars) if len(text) > max_chars else [text]
+    if not chunks:
+        raise ValueError("Text produced no chunks after splitting.")
+
+    combined_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_pdf_stream.mp3"
+    total_bytes = 0
+
+    try:
+        with open(combined_path, "wb") as out_file:
+            for chunk_text in chunks:
+                communicate = edge_tts.Communicate(
+                    text=chunk_text, voice=voice_name, rate=rate, volume=volume, pitch=pitch_hz,
+                )
+                async for message in communicate.stream():
+                    if message["type"] == "audio":
+                        data = message["data"]
+                        total_bytes += len(data)
+                        out_file.write(data)
+                        yield data  # sent to the client immediately, chunk by chunk
+    except Exception as e:
+        logger.error(f"PDF streaming error: {e}")
+        combined_path.unlink(missing_ok=True)
+        raise RuntimeError(f"PDF audio streaming failed: {e}")
+
+    if total_bytes == 0:
+        combined_path.unlink(missing_ok=True)
+        raise RuntimeError("TTS produced no audio data.")
+
+    # Cache the complete result regardless of length — this is the
+    # "save once complete" behavior. A repeat request for this exact PDF
+    # (same extracted text+voice+rate+pitch) hits the fast path above.
+    save_to_cache(text, voice_key, rate, pitch_hz, combined_path)
+
+    logger.info(
+        f"PDF streamed: {len(chunks)} chunk(s) | voice={voice_key} | "
+        f"pitch={pitch_hz} | bytes={total_bytes} | chars={len(text)}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
