@@ -1,12 +1,13 @@
 import io
 import asyncio
+import base64
 import hashlib
 import shutil
 import time
 import uuid
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import edge_tts
 import PyPDF2
@@ -88,6 +89,10 @@ VOICE_OPTIONS: dict[str, str] = {
 }
 
 DEFAULT_VOICE = "en-US-female"
+
+# Fixed sample line for the voice-preview endpoint — same text every time
+# means every preview after the first (per voice) is a pure cache hit.
+PREVIEW_TEXT = "Hi there! This is a quick preview of how I sound when reading your text aloud."
 
 LANG_DEFAULT_VOICE: dict[str, str] = {
     "hindi":   "hi-female",
@@ -253,19 +258,9 @@ def _normalize_pitch(pitch: str) -> str:
         return "+0Hz"
 
 
-async def text_to_wav(
-    text: str,
-    voice_key: str = "auto",
-    rate: str = "+0%",
-    volume: str = "+0%",
-    pitch: str = "+0Hz",
-    gender: str = "female",
-) -> tuple[Path, str]:
-    """
-    Convert text → WAV using edge-tts.
-    Returns (Path to WAV file, resolved voice_key that was used).
-    pitch accepts either native "+5Hz" format or a 0.5-2.0 slider float.
-    """
+def _resolve_voice_and_pitch(text: str, voice_key: str, pitch: str, gender: str) -> tuple[str, str, str]:
+    """Shared validation used by text_to_wav, stream_audio_chunks, and
+    text_to_wav_with_timings — keeps all three in sync on voice/pitch rules."""
     text = text.strip()
     if not text:
         raise ValueError("Text cannot be empty.")
@@ -282,7 +277,24 @@ async def text_to_wav(
             f"Available: {list(VOICE_OPTIONS.keys())} or 'auto'"
         )
 
-    pitch_hz = _normalize_pitch(pitch)
+    return voice_key, voice_name, _normalize_pitch(pitch)
+
+
+async def text_to_wav(
+    text: str,
+    voice_key: str = "auto",
+    rate: str = "+0%",
+    volume: str = "+0%",
+    pitch: str = "+0Hz",
+    gender: str = "female",
+) -> tuple[Path, str]:
+    """
+    Convert text → WAV using edge-tts.
+    Returns (Path to WAV file, resolved voice_key that was used).
+    pitch accepts either native "+5Hz" format or a 0.5-2.0 slider float.
+    """
+    voice_key, voice_name, pitch_hz = _resolve_voice_and_pitch(text, voice_key, pitch, gender)
+    text = text.strip()
 
     cached = get_cached_file(text, voice_key, rate, pitch_hz)
     if cached:
@@ -311,6 +323,222 @@ async def text_to_wav(
 
     logger.info(f"Generated: {filename.name} | voice={voice_key} | pitch={pitch_hz} | chars={len(text)}")
     return filename, voice_key
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CHUNKED GENERATION — for long PDFs. Previously /tts/pdf handed the ENTIRE
+#  extracted text straight to text_to_wav, which hard-rejects anything over
+#  50,000 characters with a generic 422 — a ~40+ page PDF just failed outright
+#  with no partial result. This splits on sentence boundaries, generates each
+#  piece (still benefiting from the normal cache), and concatenates them into
+#  one file — same approach the Android app already uses for its own
+#  client-side chunking, so playback behavior stays consistent either way.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _split_text_for_chunking(text: str, max_chars: int = 4500) -> list[str]:
+    """Splits on sentence boundaries where possible, falling back to a hard
+    cut only for single sentences longer than max_chars themselves."""
+    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    for sentence in sentences:
+        piece = sentence if sentence.endswith((".", "!", "?")) else sentence + "."
+        if len(piece) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            start = 0
+            while start < len(piece):
+                end = min(start + max_chars, len(piece))
+                if end < len(piece):
+                    last_space = piece.rfind(" ", start, end)
+                    if last_space > start:
+                        end = last_space
+                chunks.append(piece[start:end].strip())
+                start = end
+        elif len(current) + len(piece) + 1 > max_chars:
+            if current:
+                chunks.append(current.strip())
+            current = piece
+        else:
+            current = f"{current} {piece}".strip()
+
+    if current:
+        chunks.append(current.strip())
+    return [c for c in chunks if c]
+
+
+async def text_to_wav_chunked(
+    text: str,
+    voice_key: str = "auto",
+    rate: str = "+0%",
+    volume: str = "+0%",
+    pitch: str = "+0Hz",
+    gender: str = "female",
+    max_chars: int = 4500,
+) -> tuple[Path, str]:
+    """
+    Like text_to_wav, but handles text of ANY length by splitting into
+    sentence-safe chunks and concatenating the results — no more hard 422
+    on long PDFs. For text that already fits in one chunk, behaves
+    identically to calling text_to_wav directly (single generation, normal
+    caching, no concatenation overhead).
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("Text cannot be empty.")
+
+    if len(text) <= max_chars:
+        return await text_to_wav(text, voice_key, rate, volume, pitch, gender)
+
+    chunks = _split_text_for_chunking(text, max_chars)
+    if not chunks:
+        raise ValueError("Text produced no chunks after splitting.")
+
+    chunk_paths: list[Path] = []
+    used_voice = voice_key
+    try:
+        for chunk in chunks:
+            chunk_path, used_voice = await text_to_wav(chunk, voice_key, rate, volume, pitch, gender)
+            chunk_paths.append(chunk_path)
+    except Exception:
+        raise  # individual chunk errors already carry a clear message
+
+    combined = OUTPUT_DIR / f"{uuid.uuid4().hex}_combined.wav"
+    with open(combined, "wb") as out:
+        for chunk_path in chunk_paths:
+            with open(chunk_path, "rb") as f:
+                shutil.copyfileobj(f, out)
+        # NOTE: chunk_paths are cache files (get_cached_file/save_to_cache
+        # paths under CACHE_DIR) — do NOT delete them here, they're meant
+        # to persist and be reused by future requests.
+
+    logger.info(f"Chunked generation: {len(chunks)} chunks | voice={used_voice} | total_chars={len(text)}")
+    return combined, used_voice
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STREAMING — audio chunks yielded as edge-tts generates them, so a client
+#  can start playing before the whole file exists. NOTE: edge-tts's underlying
+#  wire format is MP3 (audio-24khz-48kbitrate-mono-mp3), not WAV — labeled
+#  honestly as "audio/mpeg" here rather than perpetuating the existing
+#  /tts/text endpoints' ".wav" filename (which works today only because
+#  nothing downstream currently validates the container format).
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def stream_audio_chunks(
+    text: str,
+    voice_key: str = "auto",
+    rate: str = "+0%",
+    volume: str = "+0%",
+    pitch: str = "+0Hz",
+    gender: str = "female",
+) -> AsyncGenerator[bytes, None]:
+    """
+    Yields raw MP3 audio bytes as edge-tts produces them. Also writes the
+    same bytes to the normal cache file as they stream by, so a second
+    identical request (streamed OR non-streamed) still gets a cache hit —
+    streaming doesn't opt this request out of caching, it just doesn't make
+    the FIRST request wait for the full file before anything is sent.
+    """
+    voice_key, voice_name, pitch_hz = _resolve_voice_and_pitch(text, voice_key, pitch, gender)
+    text = text.strip()
+
+    cached = get_cached_file(text, voice_key, rate, pitch_hz)
+    if cached:
+        with open(cached, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+        return
+
+    communicate = edge_tts.Communicate(
+        text=text, voice=voice_name, rate=rate, volume=volume, pitch=pitch_hz,
+    )
+
+    filename = OUTPUT_DIR / f"{uuid.uuid4().hex}.mp3"
+    total_bytes = 0
+    try:
+        with open(filename, "wb") as out_file:
+            async for message in communicate.stream():
+                if message["type"] == "audio":
+                    data = message["data"]
+                    total_bytes += len(data)
+                    out_file.write(data)
+                    yield data
+    except Exception as e:
+        logger.error(f"edge-tts streaming error: {e}")
+        filename.unlink(missing_ok=True)
+        raise RuntimeError(f"TTS streaming failed: {e}")
+
+    if total_bytes == 0:
+        filename.unlink(missing_ok=True)
+        raise RuntimeError("TTS produced no audio data.")
+
+    if len(text) <= 5_000:
+        save_to_cache(text, voice_key, rate, pitch_hz, filename)
+    else:
+        filename.unlink(missing_ok=True)  # don't leave large uncached files around
+
+    logger.info(f"Streamed: voice={voice_key} | pitch={pitch_hz} | bytes={total_bytes} | chars={len(text)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WORD-TIMED AUDIO — for a future scrubbable "listen while reading" player.
+#  Returns the full audio PLUS a list of {text, offset_ms, duration_ms} for
+#  every word, from edge-tts's WordBoundary events. Not wired into the app
+#  yet — building it now while the rest of the API is fresh.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def text_to_wav_with_timings(
+    text: str,
+    voice_key: str = "auto",
+    rate: str = "+0%",
+    volume: str = "+0%",
+    pitch: str = "+0Hz",
+    gender: str = "female",
+) -> tuple[Path, str, list[dict]]:
+    """
+    Same as text_to_wav, but also captures word-level timing. Not served
+    from the audio cache (timings aren't cached today) — always regenerates.
+    Returns (Path to audio file, resolved voice_key, word_timings list).
+    Each timing entry: {"text": str, "offset_ms": float, "duration_ms": float}.
+    """
+    voice_key, voice_name, pitch_hz = _resolve_voice_and_pitch(text, voice_key, pitch, gender)
+    text = text.strip()
+
+    communicate = edge_tts.Communicate(
+        text=text, voice=voice_name, rate=rate, volume=volume, pitch=pitch_hz,
+    )
+
+    filename = OUTPUT_DIR / f"{uuid.uuid4().hex}.mp3"
+    word_timings: list[dict] = []
+    try:
+        with open(filename, "wb") as out_file:
+            async for message in communicate.stream():
+                if message["type"] == "audio":
+                    out_file.write(message["data"])
+                elif message["type"] == "WordBoundary":
+                    # edge-tts reports offset/duration in 100-nanosecond ticks.
+                    word_timings.append({
+                        "text": message["text"],
+                        "offset_ms": message["offset"] / 10_000,
+                        "duration_ms": message["duration"] / 10_000,
+                    })
+    except Exception as e:
+        logger.error(f"edge-tts timed-generation error: {e}")
+        filename.unlink(missing_ok=True)
+        raise RuntimeError(f"TTS generation failed: {e}")
+
+    if not filename.exists() or filename.stat().st_size == 0:
+        raise RuntimeError("TTS produced an empty file.")
+
+    logger.info(
+        f"Generated with timings: voice={voice_key} | pitch={pitch_hz} | "
+        f"words={len(word_timings)} | chars={len(text)}"
+    )
+    return filename, voice_key, word_timings
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════

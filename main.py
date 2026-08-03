@@ -1,19 +1,27 @@
 import asyncio
+import base64
+import os
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from voice import (
     text_to_wav,
+    text_to_wav_chunked,
+    stream_audio_chunks,
+    text_to_wav_with_timings,
     extract_text_from_pdf,
     list_voices,
     run_garbage_collection,
     scheduled_gc,
     detect_language,
+    PREVIEW_TEXT,
 )
 
 # ══════════════════════════════════════════════════════════════════
@@ -58,6 +66,62 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ABUSE PROTECTION — rate limiting + shared-secret header
+# ══════════════════════════════════════════════════════════════════
+# Set VOXLIBRO_API_SECRET as an environment variable in the Render
+# dashboard (Environment tab) — NOT hardcoded here, and NOT committed to
+# the repo. The Android app must send the same value in the
+# "X-VoxLibro-Key" header on every /tts/* request.
+#
+# If the env var is left unset, the secret check is skipped entirely —
+# this is intentional so local development / testing via /docs still
+# works without needing the header. Once you set the env var in Render,
+# enforcement turns on automatically with no code change.
+_API_SECRET = os.environ.get("VOXLIBRO_API_SECRET", "")
+
+RATE_LIMIT_MAX_REQUESTS = 20   # per IP
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+# In-memory sliding window — fine for a single Render instance. If this
+# ever runs on multiple instances behind a load balancer, this would need
+# to move to something shared (e.g. Redis) since each instance would
+# otherwise track its own separate counts.
+_request_log: dict[str, list[float]] = defaultdict(list)
+
+
+def _client_ip(request: Request) -> str:
+    # Render sits behind a proxy — the real client IP arrives via
+    # X-Forwarded-For, not request.client.host (which would be the proxy).
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def verify_request(request: Request) -> None:
+    """Dependency applied to every TTS-consuming route: checks the shared
+    secret (if configured) and enforces per-IP rate limiting."""
+    if _API_SECRET:
+        provided = request.headers.get("x-voxlibro-key", "")
+        if provided != _API_SECRET:
+            raise HTTPException(status_code=401, detail="Missing or invalid API key.")
+
+    ip = _client_ip(request)
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
+
+    recent = [t for t in _request_log[ip] if t > window_start]
+    if len(recent) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded — max {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS}s.",
+        )
+
+    recent.append(now)
+    _request_log[ip] = recent
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -159,7 +223,7 @@ async def trigger_gc():
 #  TTS ROUTES
 # ══════════════════════════════════════════════════════════════════
 
-@app.post("/tts/text", tags=["TTS"], summary="Text → WAV (JSON body)")
+@app.post("/tts/text", tags=["TTS"], summary="Text → WAV (JSON body)", dependencies=[Depends(verify_request)])
 async def tts_from_text(request: TTSRequest, background_tasks: BackgroundTasks):
     try:
         wav_path, used_voice = await text_to_wav(
@@ -178,7 +242,7 @@ async def tts_from_text(request: TTSRequest, background_tasks: BackgroundTasks):
     return _wav_response(wav_path, used_voice, background_tasks)
 
 
-@app.post("/tts/text/form", tags=["TTS"], summary="Text → WAV (form-data)")
+@app.post("/tts/text/form", tags=["TTS"], summary="Text → WAV (form-data)", dependencies=[Depends(verify_request)])
 async def tts_from_text_form(
     background_tasks: BackgroundTasks,
     text:   str = Form(...),
@@ -205,7 +269,90 @@ async def tts_from_text_form(
     return _wav_response(wav_path, used_voice, background_tasks)
 
 
-@app.post("/tts/pdf", tags=["TTS"], summary="PDF → WAV")
+@app.post("/tts/stream", tags=["TTS"], summary="Text → streaming MP3 audio", dependencies=[Depends(verify_request)])
+async def tts_stream(
+    text:   str = Form(...),
+    voice:  str = Form("auto"),
+    gender: str = Form("female"),
+    rate:   str = Form("+0%"),
+    volume: str = Form("+0%"),
+    pitch:  str = Form("+0Hz"),
+):
+    """
+    True progressive streaming — audio chunks are sent to the client as
+    edge-tts generates them, rather than waiting for the whole file. This is
+    for perceived-speed on long texts: a client that plays chunks as they
+    arrive can start audio well before generation finishes.
+
+    Content-Type is honestly "audio/mpeg" — edge-tts's underlying wire
+    format is MP3, not WAV, regardless of what the other /tts/text* routes'
+    filenames suggest.
+
+    NOTE: this is API-level capability only. Seeing the speed benefit
+    requires the client to consume and play the stream progressively
+    (e.g. ExoPlayer/MediaPlayer pointed at this URL) — a plain "wait for the
+    whole response then play" client gets no benefit over /tts/text/form.
+    """
+    try:
+        generator = stream_audio_chunks(
+            text=text, voice_key=voice, rate=rate, volume=volume, pitch=pitch, gender=gender,
+        )
+        return StreamingResponse(generator, media_type="audio/mpeg")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tts/text/timed", tags=["TTS"], summary="Text → audio + word-level timings (JSON)", dependencies=[Depends(verify_request)])
+async def tts_text_timed(
+    background_tasks: BackgroundTasks,
+    text:   str = Form(...),
+    voice:  str = Form("auto"),
+    gender: str = Form("female"),
+    rate:   str = Form("+0%"),
+    volume: str = Form("+0%"),
+    pitch:  str = Form("+0Hz"),
+):
+    """
+    Returns a single JSON payload with base64-encoded audio AND a
+    word-by-word timing map (offset_ms/duration_ms per word), sourced from
+    edge-tts's WordBoundary events.
+
+    Built for a future "listen while reading" scrubbable player — NOT
+    currently called by the app. Not streaming (defeats the purpose here:
+    the client needs the complete timing map upfront to build a scrubber),
+    and not cached (timings aren't part of today's cache key scheme).
+
+    Response shape:
+    {
+      "voice_used": "en-US-female",
+      "audio_base64": "...",
+      "audio_format": "audio/mpeg",
+      "word_timings": [{"text": "Hello", "offset_ms": 12.5, "duration_ms": 340.0}, ...]
+    }
+    """
+    try:
+        audio_path, used_voice, word_timings = await text_to_wav_with_timings(
+            text=text, voice_key=voice, rate=rate, volume=volume, pitch=pitch, gender=gender,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    audio_bytes = audio_path.read_bytes()
+    background_tasks.add_task(_cleanup, audio_path)
+
+    return {
+        "voice_used": used_voice,
+        "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+        "audio_format": "audio/mpeg",
+        "word_timings": word_timings,
+    }
+
+
+@app.post("/tts/pdf", tags=["TTS"], summary="PDF → WAV", dependencies=[Depends(verify_request)])
 async def tts_from_pdf(
     background_tasks: BackgroundTasks,
     file:   UploadFile = File(...),
@@ -215,6 +362,13 @@ async def tts_from_pdf(
     volume: str = Form("+0%"),
     pitch:  str = Form("+0Hz"),
 ):
+    """
+    Upload a PDF file → API extracts text → returns audio. Any length is
+    now accepted — long PDFs are split into sentence-safe chunks and
+    concatenated server-side instead of hard-rejecting anything over
+    50,000 characters like before. Scanned/image-only PDFs are still
+    unsupported (no OCR).
+    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=415, detail="Only PDF files are supported.")
 
@@ -230,8 +384,30 @@ async def tts_from_pdf(
         raise HTTPException(status_code=500, detail=f"PDF parsing error: {e}")
 
     try:
-        wav_path, used_voice = await text_to_wav(
+        wav_path, used_voice = await text_to_wav_chunked(
             text=text, voice_key=voice, rate=rate, volume=volume, pitch=pitch, gender=gender,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return _wav_response(wav_path, used_voice, background_tasks)
+
+
+@app.post("/tts/preview/{voice_key}", tags=["TTS"], summary="Quick voice preview", dependencies=[Depends(verify_request)])
+async def tts_preview(voice_key: str, background_tasks: BackgroundTasks):
+    """
+    Plays a short, fixed sample line in the requested voice — for a voice
+    picker UI where users tap through options and want to hear each one
+    instantly rather than waiting on a full generation round-trip.
+    Always uses PREVIEW_TEXT at default rate/pitch, so after the very
+    first request for any given voice, every subsequent preview of that
+    same voice is a pure cache hit (no edge-tts network call at all).
+    """
+    try:
+        wav_path, used_voice = await text_to_wav(
+            text=PREVIEW_TEXT, voice_key=voice_key, rate="+0%", volume="+0%", pitch="+0Hz", gender="female",
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
