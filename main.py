@@ -160,12 +160,19 @@ def _cleanup(path: Path):
     except Exception:
         pass
 
-def _wav_response(wav_path: Path, used_voice: str, bg: BackgroundTasks) -> FileResponse:
-    bg.add_task(_cleanup, wav_path)
+def _audio_response(audio_path: Path, used_voice: str, bg: BackgroundTasks) -> FileResponse:
+    """
+    Named generically (not _wav_response) because the actual bytes are MP3
+    — edge-tts's underlying wire format is audio-24khz-48kbitrate-mono-mp3,
+    regardless of what any given output file happens to be named on disk.
+    Labeled honestly here (audio/mpeg, output.mp3) to match the streaming
+    endpoints rather than perpetuating the old audio/wav mislabeling.
+    """
+    bg.add_task(_cleanup, audio_path)
     return FileResponse(
-        path=str(wav_path),
-        media_type="audio/wav",
-        filename="output.wav",
+        path=str(audio_path),
+        media_type="audio/mpeg",
+        filename="output.mp3",
         headers={"X-Voice-Used": used_voice},
     )
 
@@ -242,7 +249,7 @@ async def tts_from_text(request: TTSRequest, background_tasks: BackgroundTasks):
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return _wav_response(wav_path, used_voice, background_tasks)
+    return _audio_response(wav_path, used_voice, background_tasks)
 
 
 @app.post("/tts/text/form", tags=["TTS"], summary="Text → WAV (form-data)", dependencies=[Depends(verify_request)])
@@ -269,7 +276,7 @@ async def tts_from_text_form(
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return _wav_response(wav_path, used_voice, background_tasks)
+    return _audio_response(wav_path, used_voice, background_tasks)
 
 
 @app.post("/tts/stream", tags=["TTS"], summary="Text → streaming MP3 audio", dependencies=[Depends(verify_request)])
@@ -396,7 +403,7 @@ async def tts_from_pdf(
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return _wav_response(wav_path, used_voice, background_tasks)
+    return _audio_response(wav_path, used_voice, background_tasks)
 
 
 @app.post("/tts/pdf/stream", tags=["TTS"], summary="PDF → streaming MP3 audio", dependencies=[Depends(verify_request)])
@@ -471,4 +478,4 @@ async def tts_preview(voice_key: str, background_tasks: BackgroundTasks):
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return _wav_response(wav_path, used_voice, background_tasks)
+    return _audio_response(wav_path, used_voice, background_tasks)

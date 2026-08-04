@@ -90,6 +90,13 @@ VOICE_OPTIONS: dict[str, str] = {
 
 DEFAULT_VOICE = "en-US-female"
 
+# Chunked/streaming generation (PDFs) has no per-request cap like the
+# normal 50,000-char single-generation limit — but completely unbounded
+# input could tie up the single free-tier worker for a very long time on
+# one pathological request, hurting responsiveness for everyone else.
+# This is generous (roughly a 150-300 page document) while still bounded.
+MAX_CHUNKED_CHARS = 300_000
+
 # Fixed sample line for the voice-preview endpoint — same text every time
 # means every preview after the first (per voice) is a pure cache hit.
 PREVIEW_TEXT = "Hi there! This is a quick preview of how I sound when reading your text aloud."
@@ -298,11 +305,15 @@ def validate_chunked_params(text: str, voice_key: str, gender: str) -> None:
     Same purpose as validate_stream_params, but for stream_pdf_audio —
     which is explicitly meant to handle text OVER 50,000 characters via
     chunking, so it must NOT apply that single-request cap. Only checks
-    that the voice key is valid and text isn't empty.
+    that the voice key is valid and text isn't empty, plus the much larger
+    MAX_CHUNKED_CHARS ceiling that protects the server from pathological
+    input rather than genuine long documents.
     """
     text = text.strip()
     if not text:
         raise ValueError("Text cannot be empty.")
+    if len(text) > MAX_CHUNKED_CHARS:
+        raise ValueError(f"Text exceeds the {MAX_CHUNKED_CHARS:,} character limit even for chunked generation.")
     resolved_key = auto_select_voice(text, preferred_gender=gender) if voice_key == "auto" else voice_key
     if resolved_key not in VOICE_OPTIONS:
         raise ValueError(
@@ -419,6 +430,8 @@ async def text_to_wav_chunked(
     text = text.strip()
     if not text:
         raise ValueError("Text cannot be empty.")
+    if len(text) > MAX_CHUNKED_CHARS:
+        raise ValueError(f"Text exceeds the {MAX_CHUNKED_CHARS:,} character limit even for chunked generation.")
 
     if len(text) <= max_chars:
         return await text_to_wav(text, voice_key, rate, volume, pitch, gender)
@@ -558,6 +571,8 @@ async def stream_pdf_audio(
     text = text.strip()
     if not text:
         raise ValueError("Text cannot be empty.")
+    if len(text) > MAX_CHUNKED_CHARS:
+        raise ValueError(f"Text exceeds the {MAX_CHUNKED_CHARS:,} character limit even for chunked generation.")
 
     resolved_voice_key = auto_select_voice(text, preferred_gender=gender) if voice_key == "auto" else voice_key
     voice_name = VOICE_OPTIONS.get(resolved_voice_key)
@@ -679,15 +694,39 @@ async def text_to_wav_with_timings(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_garbage_collection() -> int:
+    """
+    Sweeps BOTH OUTPUT_DIR (short-lived generated files, FILE_TTL_SECONDS)
+    and CACHE_DIR (longer-lived cached results, CACHE_TTL_SECONDS).
+
+    CACHE_DIR previously only got checked for staleness lazily, inside
+    get_cached_file() — an entry nobody ever requests again just sat on
+    disk forever. On Render's disk (persistent for as long as the instance
+    stays up), that's slow unbounded growth. Now swept actively here too.
+
+    Also now catches *.mp3, not just *.wav — stream_audio_chunks,
+    stream_pdf_audio, and text_to_wav_with_timings all write .mp3 files to
+    OUTPUT_DIR, which the old *.wav-only glob silently never cleaned up.
+    """
     now = time.time()
     deleted = 0
-    for f in OUTPUT_DIR.glob("*.wav"):
+
+    for pattern in ("*.wav", "*.mp3"):
+        for f in OUTPUT_DIR.glob(pattern):
+            try:
+                if now - f.stat().st_mtime > FILE_TTL_SECONDS:
+                    f.unlink()
+                    deleted += 1
+            except Exception as e:
+                logger.warning(f"GC error on {f.name}: {e}")
+
+    for f in CACHE_DIR.glob("*.wav"):  # cache files are always named {hash}.wav internally
         try:
-            if now - f.stat().st_mtime > FILE_TTL_SECONDS:
+            if now - f.stat().st_mtime > CACHE_TTL_SECONDS:
                 f.unlink()
                 deleted += 1
         except Exception as e:
-            logger.warning(f"GC error on {f.name}: {e}")
+            logger.warning(f"GC error on cache file {f.name}: {e}")
+
     if deleted:
         logger.info(f"GC: removed {deleted} expired file(s)")
     return deleted
